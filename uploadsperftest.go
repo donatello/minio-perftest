@@ -65,6 +65,7 @@ var (
 	bucket      string
 	concurrency int
 	randomSeed  int64
+	outputFile  string
 )
 
 // object generator type - generates object content without IO.
@@ -183,7 +184,8 @@ type workerMsg struct {
 	exitingErr error
 
 	// Sends time at which putobject was successful
-	putSuccTime time.Time
+	putStartTime time.Time
+	putDuration  time.Duration
 }
 
 func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan struct{}) {
@@ -193,27 +195,26 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 		return
 	}
 
-	uploader := func(doneCh chan<- error) {
+	uploader := func(doneCh chan<- workerMsg) {
 		object := NewRandomObjectWithSize(objSize)
+		startTime := time.Now().UTC()
 		_, err := mc.PutObject(bucket, object.ObjectName, &object,
 			"")
-		doneCh <- err
+		duration := time.Since(startTime)
+		doneCh <- workerMsg{err, startTime, duration}
 	}
 
 	// buffered channel so that uploader go routine does not hang.
-	doneCh := make(chan error, 1)
+	doneCh := make(chan workerMsg, 1)
 	uploadCount := 0
 	timeStart := time.Now().UTC()
 	go uploader(doneCh)
 	toQuit := false
 	for !toQuit {
 		select {
-		case uploadErr := <-doneCh:
-			workerMsgCh <- workerMsg{
-				exitingErr:  uploadErr,
-				putSuccTime: time.Now().UTC(),
-			}
-			if uploadErr != nil {
+		case uploadMsg := <-doneCh:
+			workerMsgCh <- uploadMsg
+			if uploadMsg.exitingErr != nil {
 				toQuit = true
 			} else {
 				uploadCount++
@@ -236,7 +237,45 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 	}
 }
 
-func launchTest(objSize int64) {
+type TestResult struct {
+	putStartTime []time.Time
+	putDuration  []time.Duration
+
+	secondCount map[time.Time]int
+}
+
+func NewTestResult() TestResult {
+	numSeconds := int(workerDuration.Seconds())
+	return TestResult{
+		putStartTime: make([]time.Time, 0, numSeconds*10),
+		putDuration:  make([]time.Duration, 0, numSeconds*10),
+		secondCount:  make(map[time.Time]int, numSeconds),
+	}
+}
+
+func writeCSVOutputFile(tr TestResult, outFile string) error {
+	f, err := os.Create(outFile)
+	if err != nil {
+		return err
+	}
+
+	_, err = fmt.Fprintln(f, "startTimeUnixNano,DurationNano")
+	if err != nil {
+		return err
+	}
+
+	for i, startTime := range tr.putStartTime {
+		_, err = fmt.Fprintf(f, "%v,%v\n", startTime.UnixNano(),
+			tr.putDuration[i].Nanoseconds())
+		if err != nil {
+			return err
+		}
+	}
+
+	return f.Close()
+}
+
+func launchTest(objSize int64) (TestResult, error) {
 	workerMsgCh := make(chan workerMsg)
 
 	// quitCh is buffered as some workers may have quit due to
@@ -248,11 +287,12 @@ func launchTest(objSize int64) {
 		go workerLoop(objSize, workerMsgCh, quitCh)
 	}
 
-	timeCounts := make(map[time.Time]int)
+	tRes := NewTestResult()
 	// collect results and wait for workers to quit.
 	numWorkersQuit := 0
 	isQuitting := false
 	eachSecond := time.After(time.Second)
+	var hadUploadError error
 	for numWorkersQuit < concurrency {
 		select {
 		case wMsg := <-workerMsgCh:
@@ -263,6 +303,7 @@ func launchTest(objSize int64) {
 				numWorkersQuit++
 			case wMsg.exitingErr != nil:
 				fmt.Printf("An upload attempt errored with \"%v\" - aborting test!\n", wMsg.exitingErr)
+				hadUploadError = wMsg.exitingErr
 				numWorkersQuit++
 				if !isQuitting {
 					isQuitting = true
@@ -272,15 +313,21 @@ func launchTest(objSize int64) {
 				}
 			default:
 				// got a successful upload msg.
-				uploadTime := wMsg.putSuccTime.Round(time.Second)
-				timeCounts[uploadTime]++
+				tRes.putStartTime = append(tRes.putStartTime, wMsg.putStartTime)
+				tRes.putDuration = append(tRes.putDuration, wMsg.putDuration)
+
+				putEndTime := wMsg.putStartTime.Add(wMsg.putDuration)
+				uploadTime := putEndTime.Round(time.Second)
+				tRes.secondCount[uploadTime]++
 			}
 		case <-eachSecond:
 			t := time.Now().UTC().Round(time.Second).Add(-2 * time.Second)
-			fmt.Println(t, timeCounts[t])
+			fmt.Println(t, tRes.secondCount[t])
 			eachSecond = time.After(time.Second)
 		}
 	}
+
+	return tRes, hadUploadError
 }
 
 /*
@@ -313,6 +360,7 @@ func init() {
 	flag.StringVar(&bucket, "bucket", "bucket", "Bucket to use for uploads test")
 	flag.IntVar(&concurrency, "c", 1, "concurrency - number of parallel uploads")
 	flag.Int64Var(&randomSeed, "seed", defaultRandomSeed, "random seed")
+	flag.StringVar(&outputFile, "o", "output.csv", "CSV formatted output filename")
 }
 
 func main() {
@@ -335,5 +383,16 @@ func main() {
 	rand.Seed(randomSeed)
 
 	// launch test
-	launchTest(size)
+	result, err := launchTest(size)
+	if err != nil {
+		fmt.Println("Quit due to errors.")
+		os.Exit(1)
+	}
+
+	// write output to CSV file.
+	err = writeCSVOutputFile(result, outputFile)
+	if err != nil {
+		fmt.Printf("Error writing output file: %v\n", err)
+		os.Exit(1)
+	}
 }

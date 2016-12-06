@@ -10,6 +10,8 @@ Usage of ./minio-perftest:
     	concurrency - number of parallel uploads (default 1)
   -h string
     	service endpoint host (default "localhost:9000")
+  -o string
+    	CSV formatted output filename (default "output.csv")
   -s	Set if endpoint requires https
   -seed int
     	random seed (default 42)
