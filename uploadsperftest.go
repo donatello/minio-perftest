@@ -275,8 +275,21 @@ func writeCSVOutputFile(tr TestResult, outFile string) error {
 	return f.Close()
 }
 
+func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
+	for msg := range msgCh {
+		fmt.Print(msg)
+	}
+	printerDoneCh <- struct{}{}
+}
+
 func launchTest(objSize int64) (TestResult, error) {
 	workerMsgCh := make(chan workerMsg)
+
+	// channels to print asynch.
+	// buffer upto 100 messages
+	printMsgCh := make(chan string, 100)
+	printerDoneCh := make(chan struct{})
+	go printRoutine(printMsgCh, printerDoneCh)
 
 	// quitCh is buffered as some workers may have quit due to
 	// errors when we send the quit signal.
@@ -292,6 +305,7 @@ func launchTest(objSize int64) (TestResult, error) {
 	numWorkersQuit := 0
 	isQuitting := false
 	eachSecond := time.After(time.Second)
+	startTime := time.Now().UTC().Round(time.Second)
 	var hadUploadError error
 	for numWorkersQuit < concurrency {
 		select {
@@ -320,12 +334,21 @@ func launchTest(objSize int64) (TestResult, error) {
 				uploadTime := putEndTime.Round(time.Second)
 				tRes.secondCount[uploadTime]++
 			}
+
+		// print messages about the running test each second.
 		case <-eachSecond:
-			t := time.Now().UTC().Round(time.Second).Add(-2 * time.Second)
-			fmt.Println(t, tRes.secondCount[t])
+			t := time.Now().UTC().Round(time.Second).Add(-1 * time.Second)
+			// print via a separate go routine so as to
+			// not block the for loop for printing.
+			printMsgCh <- fmt.Sprintf("%v: %v\n", t.Sub(startTime),
+				tRes.secondCount[t])
 			eachSecond = time.After(time.Second)
 		}
 	}
+
+	// Close and confirm the printing channel exits.
+	close(printMsgCh)
+	<-printerDoneCh
 
 	return tRes, hadUploadError
 }
