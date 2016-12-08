@@ -283,6 +283,13 @@ func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
 }
 
 func launchTest(objSize int64) (TestResult, error) {
+	// try to create bucket in case it doesnt exist.
+	mc, err := minio.New(endpoint, accessKey, secretKey, secure)
+	if err != nil {
+		return TestResult{}, err
+	}
+	_ = mc.MakeBucket(bucket, "")
+
 	workerMsgCh := make(chan workerMsg)
 
 	// channels to print asynch.
