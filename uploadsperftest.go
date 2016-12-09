@@ -12,8 +12,10 @@ import (
 	"strings"
 	"time"
 
-	minio "github.com/minio/minio-go"
-	// minio "github.com/minio/minio-go"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3"
 )
 
 const (
@@ -25,6 +27,9 @@ const (
 
 	// minimum per worker upload count
 	minUploadCount = 10
+
+	// maximum number of distinct objects
+	maxDistinctObjects = 1000000
 )
 
 var (
@@ -60,13 +65,39 @@ var (
 	secretKey = os.Getenv("SECRET_KEY")
 
 	// settings from command line
-	endpoint    string
-	secure      bool
-	bucket      string
-	concurrency int
-	randomSeed  int64
-	outputFile  string
+	endpoint       string
+	secure         bool
+	bucket         string
+	concurrency    int
+	randomSeed     int64
+	outputFile     string
+	maxDiskUsageGB int
+
+	// max number of distinct object names.
+	maxObjCount int
+
+	// random name generator.
+	nameGen randomObjNameGen
 )
+
+func getAWSS3Client() (*s3.S3, error) {
+	sess, err := session.NewSessionWithOptions(
+		session.Options{
+			Config: aws.Config{
+				Endpoint: aws.String(endpoint),
+				Region:   aws.String("us-east-1"),
+				Credentials: credentials.NewStaticCredentials(
+					accessKey, secretKey, ""),
+				DisableSSL:       aws.Bool(true),
+				S3ForcePathStyle: aws.Bool(true)},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return s3.New(sess), nil
+}
 
 // object generator type - generates object content without IO.
 type ObjGen struct {
@@ -79,32 +110,71 @@ type ObjGen struct {
 	// seed string that repeats inside the object
 	SeedBytes []byte
 
-	// number of bytes read
-	readCount int64
-
-	// index to read at
-	readIndex int
+	// index to read at in the whole logical object
+	readIndex int64
 }
 
 func NewRandomObjectWithSize(size int64) ObjGen {
 	return ObjGen{
-		ObjectName: getRandomObjectName(),
+		ObjectName: nameGen.getRandomObjectName(),
 		ObjectSize: size,
 		SeedBytes:  []byte(getAlNumPerm()),
 	}
 }
 
+func SetMaxObjects(size int64) {
+	maxDiskUsage := int64(maxDiskUsageGB) * 1000 * 1000 * 1000
+	maxObjCount = maxDistinctObjects
+	ratio := maxDiskUsage / size
+	if ratio < int64(maxObjCount) {
+		maxObjCount = int(ratio)
+	}
+}
+
+type randomObjNameGen struct {
+	names []string
+	ix    int
+}
+
+func (r *randomObjNameGen) getRandomObjectName() string {
+	if len(r.names) < maxObjCount {
+		r.names = append(r.names, getRandomObjectName())
+		r.ix = len(r.names) - 1
+		return r.names[r.ix]
+	}
+
+	r.ix = (r.ix + 1) % len(r.names)
+	return r.names[r.ix]
+}
+
 // implement Reader interface
 func (og *ObjGen) Read(p []byte) (n int, err error) {
-	for ; n < len(p) && og.readCount < og.ObjectSize; n++ {
-		p[n] = og.SeedBytes[og.readIndex]
-		og.readIndex = (og.readIndex + 1) % len(og.SeedBytes)
-		og.readCount++
+	for ; n < len(p) && og.readIndex < og.ObjectSize; n++ {
+		sIx := og.readIndex % int64(len(og.SeedBytes))
+		p[n] = og.SeedBytes[sIx]
+		og.readIndex++
 	}
-	if og.readCount >= og.ObjectSize {
+	if og.readIndex >= og.ObjectSize {
 		err = io.EOF
 	}
 	return
+}
+
+func (og *ObjGen) Seek(off int64, whence int) (int64, error) {
+	var nval int64
+	switch whence {
+	case io.SeekStart:
+		nval = off
+	case io.SeekCurrent:
+		nval = og.readIndex + off
+	case io.SeekEnd:
+		nval = og.ObjectSize - off
+	}
+	if nval < 0 || nval >= og.ObjectSize {
+		return 0, errors.New("invalid seek offset")
+	}
+	og.readIndex = nval
+	return og.readIndex, nil
 }
 
 // returns length of object
@@ -189,7 +259,7 @@ type workerMsg struct {
 }
 
 func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan struct{}) {
-	mc, err := minio.New(endpoint, accessKey, secretKey, secure)
+	s3Client, err := getAWSS3Client()
 	if err != nil {
 		workerMsgCh <- workerMsg{exitingErr: err}
 		return
@@ -198,8 +268,12 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 	uploader := func(doneCh chan<- workerMsg) {
 		object := NewRandomObjectWithSize(objSize)
 		startTime := time.Now().UTC()
-		_, err := mc.PutObject(bucket, object.ObjectName, &object,
-			"")
+
+		_, err := s3Client.PutObject(&s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(object.ObjectName),
+			Body:   &object,
+		})
 		duration := time.Since(startTime)
 		doneCh <- workerMsg{err, startTime, duration}
 	}
@@ -283,12 +357,18 @@ func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
 }
 
 func launchTest(objSize int64) (TestResult, error) {
+	SetMaxObjects(objSize)
+
 	// try to create bucket in case it doesnt exist.
-	mc, err := minio.New(endpoint, accessKey, secretKey, secure)
+	s3Client, err := getAWSS3Client()
 	if err != nil {
 		return TestResult{}, err
 	}
-	_ = mc.MakeBucket(bucket, "")
+
+	// ignore error as it is most likely that the bucket exists.
+	_, _ = s3Client.CreateBucket(&s3.CreateBucketInput{
+		Bucket: aws.String(bucket),
+	})
 
 	workerMsgCh := make(chan workerMsg)
 
@@ -391,6 +471,7 @@ func init() {
 	flag.IntVar(&concurrency, "c", 1, "concurrency - number of parallel uploads")
 	flag.Int64Var(&randomSeed, "seed", defaultRandomSeed, "random seed")
 	flag.StringVar(&outputFile, "o", "output.csv", "CSV formatted output filename")
+	flag.IntVar(&maxDiskUsageGB, "m", 80, "Maximum amount of disk usage in GBs")
 }
 
 func main() {
@@ -415,7 +496,7 @@ func main() {
 	// launch test
 	result, err := launchTest(size)
 	if err != nil {
-		fmt.Println("Quit due to errors.")
+		fmt.Println("Quit due to errors:", err)
 		os.Exit(1)
 	}
 
