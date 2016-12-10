@@ -29,7 +29,7 @@ const (
 	minUploadCount = 10
 
 	// maximum number of distinct objects
-	maxDistinctObjects = 1000000
+	maxDistinctObjects = 100000
 )
 
 var (
@@ -70,33 +70,51 @@ var (
 	bucket         string
 	concurrency    int
 	randomSeed     int64
-	outputFile     string
 	maxDiskUsageGB int
 
 	// max number of distinct object names.
 	maxObjCount int
 
-	// random name generator.
-	nameGen randomObjNameGen
+	// random object names
+	randObjNames []string
 )
 
-func getAWSS3Client() (*s3.S3, error) {
-	sess, err := session.NewSessionWithOptions(
-		session.Options{
-			Config: aws.Config{
-				Endpoint: aws.String(endpoint),
-				Region:   aws.String("us-east-1"),
-				Credentials: credentials.NewStaticCredentials(
-					accessKey, secretKey, ""),
-				DisableSSL:       aws.Bool(true),
-				S3ForcePathStyle: aws.Bool(true)},
-		},
-	)
-	if err != nil {
-		return nil, err
+func generateNames() {
+	fmt.Println("Generating names for objects...")
+	randObjNames = make([]string, 0, maxObjCount)
+	for i := 0; i < maxObjCount; i++ {
+		randObjNames = append(randObjNames, getRandomObjectName())
 	}
+	fmt.Println("done.")
+}
 
-	return s3.New(sess), nil
+func setMaxObjects(size int64) {
+	maxDiskUsage := int64(maxDiskUsageGB) * 1000 * 1000 * 1000
+	maxObjCount = maxDistinctObjects
+	ratio := maxDiskUsage / size
+	if ratio < int64(maxObjCount) {
+		maxObjCount = int(ratio)
+	}
+}
+
+func getAlNumPerm() string {
+	n := len(alNum)
+	p := rand.Perm(n)
+	objNameRunes := make([]rune, n)
+	for i := 0; i < n; i++ {
+		objNameRunes[i] = alNum[p[i]]
+	}
+	return string(objNameRunes)
+}
+
+func getRandomObjectName() string {
+	dirString := parentDirs[rand.Intn(len(parentDirs))]
+	objPath := filepath.Join(strings.Fields(dirString)...)
+
+	rnum := rand.Intn(1000000000)
+	n := fmt.Sprintf("%v%v%v", rnum, rnum, rnum)
+
+	return filepath.Join(objPath, n)
 }
 
 // object generator type - generates object content without IO.
@@ -116,35 +134,10 @@ type ObjGen struct {
 
 func NewRandomObjectWithSize(size int64) ObjGen {
 	return ObjGen{
-		ObjectName: nameGen.getRandomObjectName(),
+		ObjectName: randObjNames[rand.Intn(len(randObjNames))],
 		ObjectSize: size,
 		SeedBytes:  []byte(getAlNumPerm()),
 	}
-}
-
-func SetMaxObjects(size int64) {
-	maxDiskUsage := int64(maxDiskUsageGB) * 1000 * 1000 * 1000
-	maxObjCount = maxDistinctObjects
-	ratio := maxDiskUsage / size
-	if ratio < int64(maxObjCount) {
-		maxObjCount = int(ratio)
-	}
-}
-
-type randomObjNameGen struct {
-	names []string
-	ix    int
-}
-
-func (r *randomObjNameGen) getRandomObjectName() string {
-	if len(r.names) < maxObjCount {
-		r.names = append(r.names, getRandomObjectName())
-		r.ix = len(r.names) - 1
-		return r.names[r.ix]
-	}
-
-	r.ix = (r.ix + 1) % len(r.names)
-	return r.names[r.ix]
 }
 
 // implement Reader interface
@@ -180,26 +173,6 @@ func (og *ObjGen) Seek(off int64, whence int) (int64, error) {
 // returns length of object
 func (og *ObjGen) Size() int64 {
 	return og.ObjectSize
-}
-
-func getAlNumPerm() string {
-	n := len(alNum)
-	p := rand.Perm(n)
-	objNameRunes := make([]rune, n)
-	for i := 0; i < n; i++ {
-		objNameRunes[i] = alNum[p[i]]
-	}
-	return string(objNameRunes)
-}
-
-func getRandomObjectName() string {
-	dirString := parentDirs[rand.Intn(len(parentDirs))]
-	objPath := filepath.Join(strings.Fields(dirString)...)
-
-	pStr := getAlNumPerm()
-	n := 1 + rand.Intn(len(pStr))
-
-	return filepath.Join(objPath, pStr[:n])
 }
 
 // Returns number of bytes expressed by human friendly
@@ -243,6 +216,25 @@ func parseHumanNumber(s string) (int64, error) {
 	return n, nil
 }
 
+func getAWSS3Client() (*s3.S3, error) {
+	sess, err := session.NewSessionWithOptions(
+		session.Options{
+			Config: aws.Config{
+				Endpoint: aws.String(endpoint),
+				Region:   aws.String("us-east-1"),
+				Credentials: credentials.NewStaticCredentials(
+					accessKey, secretKey, ""),
+				DisableSSL:       aws.Bool(true),
+				S3ForcePathStyle: aws.Bool(true)},
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return s3.New(sess), nil
+}
+
 var (
 	errWorkerSucc = errors.New("Worker is exiting with success.")
 	errWorkerQuit = errors.New("Worker is quitting due to quit signal.")
@@ -265,7 +257,7 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 		return
 	}
 
-	uploader := func(doneCh chan<- workerMsg) {
+	uploader := func(doneCh chan<- workerMsg, s3Client *s3.S3) {
 		object := NewRandomObjectWithSize(objSize)
 		startTime := time.Now().UTC()
 
@@ -275,6 +267,9 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 			Body:   &object,
 		})
 		duration := time.Since(startTime)
+		if err != nil {
+			err = fmt.Errorf("PutObject Error for bucket %v and key %v - %v", bucket, object.ObjectName, err)
+		}
 		doneCh <- workerMsg{err, startTime, duration}
 	}
 
@@ -282,7 +277,7 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 	doneCh := make(chan workerMsg, 1)
 	uploadCount := 0
 	timeStart := time.Now().UTC()
-	go uploader(doneCh)
+	go uploader(doneCh, s3Client)
 	toQuit := false
 	for !toQuit {
 		select {
@@ -294,7 +289,7 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 				uploadCount++
 				if time.Since(timeStart) < workerDuration ||
 					uploadCount < minUploadCount {
-					go uploader(doneCh)
+					go uploader(doneCh, s3Client)
 				} else {
 					workerMsgCh <- workerMsg{
 						exitingErr: errWorkerSucc,
@@ -312,41 +307,22 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 }
 
 type TestResult struct {
-	putStartTime []time.Time
-	putDuration  []time.Duration
+	// putStartTime []time.Time
+	// putDuration  []time.Duration
 
-	secondCount map[time.Time]int
+	startTime   time.Time
+	objectSize  int64
+	objectCount int64
 }
 
-func NewTestResult() TestResult {
-	numSeconds := int(workerDuration.Seconds())
-	return TestResult{
-		putStartTime: make([]time.Time, 0, numSeconds*10),
-		putDuration:  make([]time.Duration, 0, numSeconds*10),
-		secondCount:  make(map[time.Time]int, numSeconds),
-	}
-}
+func (tr *TestResult) getTRMessage() string {
+	timeSoFar := time.Now().UTC().Sub(tr.startTime).Seconds()
+	bandwidthMiBps := float64(tr.objectCount) * float64(tr.objectSize) /
+		(timeSoFar * 1024 * 1024)
+	objps := float64(tr.objectCount) / timeSoFar
 
-func writeCSVOutputFile(tr TestResult, outFile string) error {
-	f, err := os.Create(outFile)
-	if err != nil {
-		return err
-	}
-
-	_, err = fmt.Fprintln(f, "startTimeUnixNano,DurationNano")
-	if err != nil {
-		return err
-	}
-
-	for i, startTime := range tr.putStartTime {
-		_, err = fmt.Fprintf(f, "%v,%v\n", startTime.UnixNano(),
-			tr.putDuration[i].Nanoseconds())
-		if err != nil {
-			return err
-		}
-	}
-
-	return f.Close()
+	return fmt.Sprintf("At %.2f: Avg data b/w: %.2f MiBps. Avg obj/s: %.2f\n",
+		timeSoFar, bandwidthMiBps, objps)
 }
 
 func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
@@ -356,8 +332,9 @@ func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
 	printerDoneCh <- struct{}{}
 }
 
-func launchTest(objSize int64) (TestResult, error) {
-	SetMaxObjects(objSize)
+func launchTest(objSize int64) (tr TestResult, err error) {
+	setMaxObjects(objSize)
+	generateNames()
 
 	// try to create bucket in case it doesnt exist.
 	s3Client, err := getAWSS3Client()
@@ -387,12 +364,12 @@ func launchTest(objSize int64) (TestResult, error) {
 		go workerLoop(objSize, workerMsgCh, quitCh)
 	}
 
-	tRes := NewTestResult()
 	// collect results and wait for workers to quit.
 	numWorkersQuit := 0
 	isQuitting := false
-	eachSecond := time.After(time.Second)
-	startTime := time.Now().UTC().Round(time.Second)
+	eachInterval := time.After(time.Second * 10)
+	tr.startTime = time.Now().UTC()
+	tr.objectSize = objSize
 	var hadUploadError error
 	for numWorkersQuit < concurrency {
 		select {
@@ -414,22 +391,18 @@ func launchTest(objSize int64) (TestResult, error) {
 				}
 			default:
 				// got a successful upload msg.
-				tRes.putStartTime = append(tRes.putStartTime, wMsg.putStartTime)
-				tRes.putDuration = append(tRes.putDuration, wMsg.putDuration)
+				// tRes.putStartTime = append(tRes.putStartTime, wMsg.putStartTime)
+				// tRes.putDuration = append(tRes.putDuration, wMsg.putDuration)
 
-				putEndTime := wMsg.putStartTime.Add(wMsg.putDuration)
-				uploadTime := putEndTime.Round(time.Second)
-				tRes.secondCount[uploadTime]++
+				tr.objectCount++
 			}
 
 		// print messages about the running test each second.
-		case <-eachSecond:
-			t := time.Now().UTC().Round(time.Second).Add(-1 * time.Second)
+		case <-eachInterval:
 			// print via a separate go routine so as to
 			// not block the for loop for printing.
-			printMsgCh <- fmt.Sprintf("%v: %v\n", t.Sub(startTime),
-				tRes.secondCount[t])
-			eachSecond = time.After(time.Second)
+			printMsgCh <- tr.getTRMessage()
+			eachInterval = time.After(time.Second * 10)
 		}
 	}
 
@@ -437,7 +410,7 @@ func launchTest(objSize int64) (TestResult, error) {
 	close(printMsgCh)
 	<-printerDoneCh
 
-	return tRes, hadUploadError
+	return tr, hadUploadError
 }
 
 /*
@@ -470,7 +443,6 @@ func init() {
 	flag.StringVar(&bucket, "bucket", "bucket", "Bucket to use for uploads test")
 	flag.IntVar(&concurrency, "c", 1, "concurrency - number of parallel uploads")
 	flag.Int64Var(&randomSeed, "seed", defaultRandomSeed, "random seed")
-	flag.StringVar(&outputFile, "o", "output.csv", "CSV formatted output filename")
 	flag.IntVar(&maxDiskUsageGB, "m", 80, "Maximum amount of disk usage in GBs")
 }
 
@@ -500,10 +472,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	// write output to CSV file.
-	err = writeCSVOutputFile(result, outputFile)
-	if err != nil {
-		fmt.Printf("Error writing output file: %v\n", err)
-		os.Exit(1)
-	}
+	fmt.Print(result.getTRMessage())
 }
