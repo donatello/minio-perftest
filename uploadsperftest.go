@@ -216,8 +216,8 @@ func parseHumanNumber(s string) (int64, error) {
 	return n, nil
 }
 
-func getAWSS3Client() (*s3.S3, error) {
-	sess, err := session.NewSessionWithOptions(
+func getAWSSession() (*session.Session, error) {
+	return session.NewSessionWithOptions(
 		session.Options{
 			Config: aws.Config{
 				Endpoint: aws.String(endpoint),
@@ -228,11 +228,6 @@ func getAWSS3Client() (*s3.S3, error) {
 				S3ForcePathStyle: aws.Bool(true)},
 		},
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	return s3.New(sess), nil
 }
 
 var (
@@ -251,17 +246,19 @@ type workerMsg struct {
 }
 
 func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan struct{}) {
-	s3Client, err := getAWSS3Client()
+	session, err := getAWSSession()
 	if err != nil {
 		workerMsgCh <- workerMsg{exitingErr: err}
 		return
 	}
 
-	uploader := func(doneCh chan<- workerMsg, s3Client *s3.S3) {
+	uploader := func(doneCh chan<- workerMsg) {
 		object := NewRandomObjectWithSize(objSize)
 		startTime := time.Now().UTC()
 
-		_, err := s3Client.PutObject(&s3.PutObjectInput{
+		s3Client := s3.New(session)
+
+		_, err = s3Client.PutObject(&s3.PutObjectInput{
 			Bucket: aws.String(bucket),
 			Key:    aws.String(object.ObjectName),
 			Body:   &object,
@@ -277,7 +274,7 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 	doneCh := make(chan workerMsg, 1)
 	uploadCount := 0
 	timeStart := time.Now().UTC()
-	go uploader(doneCh, s3Client)
+	go uploader(doneCh)
 	toQuit := false
 	for !toQuit {
 		select {
@@ -289,7 +286,7 @@ func workerLoop(objSize int64, workerMsgCh chan<- workerMsg, quitChan <-chan str
 				uploadCount++
 				if time.Since(timeStart) < workerDuration ||
 					uploadCount < minUploadCount {
-					go uploader(doneCh, s3Client)
+					go uploader(doneCh)
 				} else {
 					workerMsgCh <- workerMsg{
 						exitingErr: errWorkerSucc,
@@ -337,10 +334,11 @@ func launchTest(objSize int64) (tr TestResult, err error) {
 	generateNames()
 
 	// try to create bucket in case it doesnt exist.
-	s3Client, err := getAWSS3Client()
+	session, err := getAWSSession()
 	if err != nil {
 		return TestResult{}, err
 	}
+	s3Client := s3.New(session)
 
 	// ignore error as it is most likely that the bucket exists.
 	_, _ = s3Client.CreateBucket(&s3.CreateBucketInput{
