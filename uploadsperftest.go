@@ -142,10 +142,20 @@ func NewRandomObjectWithSize(size int64) ObjGen {
 
 // implement Reader interface
 func (og *ObjGen) Read(p []byte) (n int, err error) {
-	for ; n < len(p) && og.readIndex < og.ObjectSize; n++ {
-		sIx := og.readIndex % int64(len(og.SeedBytes))
-		p[n] = og.SeedBytes[sIx]
-		og.readIndex++
+	for n < len(p) && og.readIndex < og.ObjectSize {
+		bufIxStart := og.readIndex % int64(len(og.SeedBytes))
+		bytesLeftInObject := og.ObjectSize - og.readIndex
+		bytesLeftInSeedBytes := int64(len(og.SeedBytes)) - bufIxStart
+		var wroteCount int
+		if bytesLeftInObject < bytesLeftInSeedBytes {
+			wroteCount = copy(p[n:],
+				og.SeedBytes[bufIxStart:bufIxStart+bytesLeftInObject])
+		} else {
+			wroteCount = copy(p[n:],
+				og.SeedBytes[bufIxStart:])
+		}
+		n += wroteCount
+		og.readIndex += int64(wroteCount)
 	}
 	if og.readIndex >= og.ObjectSize {
 		err = io.EOF
