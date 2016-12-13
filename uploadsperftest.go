@@ -328,8 +328,12 @@ func (tr *TestResult) getTRMessage() string {
 		(timeSoFar * 1024 * 1024)
 	objps := float64(tr.objectCount) / timeSoFar
 
-	return fmt.Sprintf("At %.2f: Avg data b/w: %.2f MiBps. Avg obj/s: %.2f\n",
-		timeSoFar, bandwidthMiBps, objps)
+	totalDataWrittenMiB := float64(tr.objectCount*tr.objectSize) /
+		float64(1024*1024)
+
+	return fmt.Sprintf("At %.2f: Avg data b/w: %.2f MiBps. Avg obj/s: %.2f. Data Written: %0.2f MiB in %v objects.\n",
+		timeSoFar, bandwidthMiBps, objps, totalDataWrittenMiB,
+		tr.objectCount)
 }
 
 func printRoutine(msgCh chan string, printerDoneCh chan struct{}) {
